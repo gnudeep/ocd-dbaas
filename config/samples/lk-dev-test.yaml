@@ -1,0 +1,18 @@
+apiVersion: dbaas.wso2.com/v1alpha1
+kind: DBInstance
+metadata:
+  name: dev-test-01
+  namespace: default
+spec:
+  dbInstanceClass: db.t3.small
+  dbName: testdb
+  port: 5432
+  masterUsername: dbadmin
+  manageMasterUserPassword: true
+  allocatedStorage: 10
+  storageType: longhorn
+  deletionProtection: false
+  running: true
+  vmPassword: dbaas-dev
+  osImage: ubuntu-22-04
+  networkRef: iaas/vm-network-001

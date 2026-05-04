@@ -6,13 +6,16 @@ import (
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:scope=Cluster,shortName=dbi
+// +kubebuilder:resource:shortName=dbi
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Class",type=string,JSONPath=`.spec.dbInstanceClass`
 // +kubebuilder:printcolumn:name="Endpoint",type=string,JSONPath=`.status.endpoint.address`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // DBInstance represents a managed PostgreSQL database on Harvester HCI.
+// Namespaced — each DBInstance lives in a tenant namespace. All Harvester
+// child resources (VM, DataVolume, Secret, Service, ServiceMonitor) are
+// created in the same namespace as the DBInstance.
 type DBInstance struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -80,6 +83,13 @@ type DBInstanceSpec struct {
 
 	// OSImage is the Harvester VM image name. Default "ubuntu-22.04-server-cloudimg-amd64.img".
 	OSImage string `json:"osImage,omitempty"`
+
+	// NetworkRef is a Harvester NAD reference (namespace/name) for an existing
+	// VLAN network to attach the VM to as its primary NIC. When set, the controller
+	// skips Kube-OVN VPC/Subnet/NAD creation and uses this NAD directly.
+	// Use this on clusters where Kube-OVN VPC is not available.
+	// Example: "iaas-net/vm-subnet-001"
+	NetworkRef string `json:"networkRef,omitempty"`
 
 	// ConsumerNetwork is the Harvester NAD reference (namespace/name) for a consumer
 	// VLAN that application workloads use to reach the database directly via L2.
@@ -170,8 +180,9 @@ type MasterUserSecretRef struct {
 // ResourceRefs tracks every Harvester resource the controller created.
 // Each field is populated as the corresponding phase completes.
 // On controller restart, the reconciler reads these to skip completed phases.
+// All resources live in the DBInstance's own namespace — read it via
+// inst.Namespace, not from this struct.
 type ResourceRefs struct {
-	Namespace      string `json:"namespace,omitempty"`
 	VPCName        string `json:"vpcName,omitempty"`
 	SubnetName     string `json:"subnetName,omitempty"`
 	NADName        string `json:"nadName,omitempty"`
@@ -195,7 +206,7 @@ type DBInstanceList struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:scope=Cluster,shortName=dbs
+// +kubebuilder:resource:shortName=dbs
 type DBSnapshot struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -229,7 +240,7 @@ type DBSnapshotList struct {
 // ============================================================
 
 // +kubebuilder:object:root=true
-// +kubebuilder:resource:scope=Cluster,shortName=dbpg
+// +kubebuilder:resource:shortName=dbpg
 type DBParameterGroup struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -256,7 +267,6 @@ type DBParameterGroupList struct {
 
 const (
 	PhasePending             = "Pending"
-	PhaseNamespaceCreated    = "NamespaceCreated"
 	PhaseNetworkProvisioned  = "NetworkProvisioned"
 	PhaseStorageProvisioned  = "StorageProvisioned"
 	PhaseVMCreated           = "VMCreated"

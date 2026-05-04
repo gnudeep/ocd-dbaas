@@ -3,6 +3,7 @@ package gateway
 import (
 	"encoding/json"
 	"net/http"
+	"os"
 	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -11,6 +12,16 @@ import (
 
 	dbaasv1 "github.com/wso2/open-cloud-datacenter/dbaas/api/v1alpha1"
 )
+
+// defaultNamespace is the fallback namespace the gateway operates in.
+// Set via DBAAS_DEFAULT_NAMESPACE env var. Replaced by Asgardeo-driven
+// tenant context in a later phase (see production-design.md §5).
+func defaultNamespace() string {
+	if ns := os.Getenv("DBAAS_DEFAULT_NAMESPACE"); ns != "" {
+		return ns
+	}
+	return "default"
+}
 
 func RunGateway(addr string, k8sClient client.Client) error {
 	auth := newAuthMiddleware(k8sClient, "dbaas-api-keys", "dbaas-system")
@@ -73,6 +84,9 @@ func handleCreateInstance(w http.ResponseWriter, r *http.Request, k8sClient clie
 	if instance.Kind == "" {
 		instance.Kind = "DBInstance"
 	}
+	if instance.Namespace == "" {
+		instance.Namespace = defaultNamespace()
+	}
 	if err := k8sClient.Create(r.Context(), &instance); err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			writeError(w, http.StatusConflict, err.Error())
@@ -125,7 +139,7 @@ func handleGetInstance(w http.ResponseWriter, r *http.Request, k8sClient client.
 		return
 	}
 	var instance dbaasv1.DBInstance
-	if err := k8sClient.Get(r.Context(), types.NamespacedName{Name: name}, &instance); err != nil {
+	if err := k8sClient.Get(r.Context(), types.NamespacedName{Namespace: defaultNamespace(), Name: name}, &instance); err != nil {
 		if apierrors.IsNotFound(err) {
 			writeError(w, http.StatusNotFound, err.Error())
 			return
@@ -142,6 +156,7 @@ func handleDeleteInstance(w http.ResponseWriter, r *http.Request, k8sClient clie
 	}
 	instance := &dbaasv1.DBInstance{}
 	instance.Name = name
+	instance.Namespace = defaultNamespace()
 	instance.APIVersion = dbaasv1.GroupVersion.String()
 	instance.Kind = "DBInstance"
 
@@ -161,7 +176,7 @@ func handleSetRunning(w http.ResponseWriter, r *http.Request, k8sClient client.C
 		return
 	}
 	var instance dbaasv1.DBInstance
-	if err := k8sClient.Get(r.Context(), types.NamespacedName{Name: name}, &instance); err != nil {
+	if err := k8sClient.Get(r.Context(), types.NamespacedName{Namespace: defaultNamespace(), Name: name}, &instance); err != nil {
 		if apierrors.IsNotFound(err) {
 			writeError(w, http.StatusNotFound, err.Error())
 			return

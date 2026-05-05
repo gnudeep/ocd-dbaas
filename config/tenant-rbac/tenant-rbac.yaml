@@ -1,0 +1,40 @@
+# Per-tenant RBAC — apply once per tenant namespace at onboarding time.
+#
+# Grants the dbaas-controller ServiceAccount (in dbaas-system) permission
+# to manage DBInstances, Secrets, Services, ConfigMaps, and Events within
+# one tenant namespace. Apply with:
+#
+#   make tenant-onboard NAMESPACE=<namespace>
+#
+# Or manually:
+#   NAMESPACE=orders-team envsubst < config/tenant-rbac/tenant-rbac.yaml | kubectl apply -f -
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dbaas-controller
+  namespace: ${NAMESPACE}
+rules:
+- apiGroups: ["dbaas.wso2.com"]
+  resources: ["dbinstances", "dbinstances/status", "dbinstances/finalizers"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["secrets", "services", "configmaps", "events"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["monitoring.coreos.com"]
+  resources: ["servicemonitors"]
+  verbs: ["get", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dbaas-controller
+  namespace: ${NAMESPACE}
+subjects:
+- kind: ServiceAccount
+  name: dbaas-controller
+  namespace: dbaas-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: dbaas-controller

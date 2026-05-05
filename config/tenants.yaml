@@ -1,0 +1,39 @@
+# DBaaS tenant configuration
+#
+# Each entry maps an Asgardeo group to a Kubernetes namespace, VLAN network,
+# and resource quotas. The gateway loads this at startup.
+#
+# To onboard a new tenant:
+#   1. Create the namespace:  kubectl create namespace <namespace>
+#   2. Add an entry below
+#   3. Update the ConfigMap:  kubectl create configmap dbaas-tenants \
+#                               --from-file=tenants.yaml=config/tenants.yaml \
+#                               -n dbaas-system --dry-run=client -o yaml | kubectl apply -f -
+#   4. Restart the gateway:   kubectl rollout restart deployment/dbaas-controller -n dbaas-system
+
+tenants:
+  # IaaS team — platform testing and development.
+  # namespace: default is used until the iaas namespace is created on the cluster.
+  - group: iaas-dbs
+    namespace: default
+    networkRef: iaas/vm-network-001
+    quotas:
+      maxInstances: 10
+      maxStorageGiB: 500
+      allowedInstanceClasses:
+        - db.t3.small
+        - db.t3.medium
+        - db.m5.large
+        - db.m5.xlarge
+
+  # Example: orders service team
+  # Uncomment and adjust when onboarding this team.
+  # - group: orders-team-dbs
+  #   namespace: orders-team
+  #   networkRef: iaas/vm-network-001
+  #   quotas:
+  #     maxInstances: 5
+  #     maxStorageGiB: 200
+  #     allowedInstanceClasses:
+  #       - db.t3.small
+  #       - db.m5.large

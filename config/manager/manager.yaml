@@ -52,11 +52,22 @@ spec:
           limits:
             cpu: 500m
             memory: 512Mi
+        env:
+        - name: DBAAS_TENANTS_CONFIG
+          value: /etc/dbaas/tenants.yaml
+        volumeMounts:
+        - name: tenants-config
+          mountPath: /etc/dbaas
+          readOnly: true
         securityContext:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true
           capabilities:
             drop: ["ALL"]
+      volumes:
+      - name: tenants-config
+        configMap:
+          name: dbaas-tenants
 ---
 apiVersion: v1
 kind: Service

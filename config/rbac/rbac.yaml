@@ -52,7 +52,7 @@ rules:
   verbs: ["get", "list"]
 - apiGroups: [""]
   resources: ["secrets"]
-  verbs: ["get", "create", "update", "delete"]
+  verbs: ["get", "list", "watch", "create", "update", "delete"]
 - apiGroups: [""]
   resources: ["services"]
   verbs: ["get", "create", "delete"]

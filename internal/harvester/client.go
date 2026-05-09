@@ -479,12 +479,18 @@ func (c *Client) TeardownAll(ctx context.Context, id, ns string, refs dbaasv1.Re
 		namespace string
 		name      string
 	}
+	// Only delete the NAD if we created it (VPC mode). In direct NAD mode
+	// (networkRef), VPCName is empty and the NAD is owned by the cluster operator.
+	ownedNAD := ""
+	if refs.VPCName != "" {
+		ownedNAD = refs.NADName
+	}
 	tasks := []deleteTask{
 		{smGVR, ns, refs.ServiceMonitor},
 		{vmGVR, ns, refs.VMName},
 		{dvGVR, ns, refs.DataVolumeName},
 		{secretGVR, ns, refs.SecretName},
-		{nadGVR, ns, refs.NADName},
+		{nadGVR, ns, ownedNAD},
 		{subnetGVR, "", refs.SubnetName},
 		{vpcPeeringGVR, "", refs.VpcPeeringName},
 		{vpcGVR, "", refs.VPCName},
@@ -524,6 +530,10 @@ func vmInterfaces(consumerNetwork string) []interface{} {
 }
 
 func vmNetworks(namespace, nadName, consumerNetwork string) []interface{} {
+	networkName := nadName
+	if !strings.Contains(nadName, "/") {
+		networkName = fmt.Sprintf("%s/%s", namespace, nadName)
+	}
 	nets := []interface{}{
 		map[string]interface{}{
 			"name": "mgmt-net",
@@ -531,7 +541,7 @@ func vmNetworks(namespace, nadName, consumerNetwork string) []interface{} {
 		},
 		map[string]interface{}{
 			"name":   "vpc-net",
-			"multus": map[string]interface{}{"networkName": fmt.Sprintf("%s/%s", namespace, nadName)},
+			"multus": map[string]interface{}{"networkName": networkName},
 		},
 	}
 	if consumerNetwork != "" {

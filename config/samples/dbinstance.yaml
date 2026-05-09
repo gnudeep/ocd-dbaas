@@ -1,15 +1,16 @@
 # Sample: Create a PostgreSQL database on Harvester
 #
 # Apply with: kubectl apply -f config/samples/
-# Watch progress: kubectl get dbi orders-prod -w
-# Check details:  kubectl describe dbi orders-prod
-# Get JDBC URL:   kubectl get dbi orders-prod -o jsonpath='{.status.endpoint.jdbcUrl}'
-# Get password:   kubectl get secret pg-orders-prod-credentials -n dbaas-orders-prod -o jsonpath='{.data.admin_password}' | base64 -d
+# Watch progress: kubectl -n default get dbi orders-prod -w
+# Check details:  kubectl -n default describe dbi orders-prod
+# Get JDBC URL:   kubectl -n default get dbi orders-prod -o jsonpath='{.status.endpoint.jdbcUrl}'
+# Get password:   kubectl -n default get secret pg-orders-prod-credentials -o jsonpath='{.data.admin_password}' | base64 -d
 
 apiVersion: dbaas.wso2.com/v1alpha1
 kind: DBInstance
 metadata:
   name: orders-prod
+  namespace: default
 spec:
   dbInstanceClass: db.m5.large      # 2 CPU, 8GB RAM, 200 max connections
   engineVersion: "16"

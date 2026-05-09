@@ -20,8 +20,8 @@ spec:
         runAsNonRoot: true
       containers:
       - name: controller
-        image: wso2vick/ocd-dbaas:v0.3.0
-        imagePullPolicy: IfNotPresent
+        image: ghcr.io/akini98/ocd-dbaas:dev
+        imagePullPolicy: Always
         args:
         - --gateway-address=:8080
         - --metrics-bind-address=:8081
@@ -52,11 +52,22 @@ spec:
           limits:
             cpu: 500m
             memory: 512Mi
+        env:
+        - name: DBAAS_TENANTS_CONFIG
+          value: /etc/dbaas/tenants.yaml
+        volumeMounts:
+        - name: tenants-config
+          mountPath: /etc/dbaas
+          readOnly: true
         securityContext:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true
           capabilities:
             drop: ["ALL"]
+      volumes:
+      - name: tenants-config
+        configMap:
+          name: dbaas-tenants
 ---
 apiVersion: v1
 kind: Service

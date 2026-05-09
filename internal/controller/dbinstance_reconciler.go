@@ -6,9 +6,7 @@ import (
 	"sync"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -80,8 +78,6 @@ func (r *DBInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// --- Phase-based provisioning ---
 	switch inst.Status.ProvisioningPhase {
 	case "", dbaasv1.PhasePending:
-		return r.phaseNamespace(ctx, &inst)
-	case dbaasv1.PhaseNamespaceCreated:
 		return r.phaseNetwork(ctx, &inst)
 	case dbaasv1.PhaseNetworkProvisioned:
 		return r.phaseStorage(ctx, &inst)
@@ -108,35 +104,28 @@ func (r *DBInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 // Provisioning phases
 // ============================================================
 
-func (r *DBInstanceReconciler) phaseNamespace(ctx context.Context, inst *dbaasv1.DBInstance) (ctrl.Result, error) {
-	ns := fmt.Sprintf("dbaas-%s", inst.Name)
-	nsObj := &corev1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:   ns,
-			Labels: map[string]string{dbaasv1.LabelInstance: inst.Name},
-		},
-	}
-	if err := r.Create(ctx, nsObj); err != nil && !errors.IsAlreadyExists(err) {
-		return r.fail(ctx, inst, "NamespaceCreateFailed", err)
-	}
-
-	inst.Status.Phase = dbaasv1.StatusCreating
-	inst.Status.ProvisioningPhase = dbaasv1.PhaseNamespaceCreated
-	inst.Status.Resources.Namespace = ns
-	inst.Status.Message = "Namespace created"
-
-	return r.advance(ctx, inst)
-}
-
 func (r *DBInstanceReconciler) phaseNetwork(ctx context.Context, inst *dbaasv1.DBInstance) (ctrl.Result, error) {
-	// Skip if already done
-	if inst.Status.Resources.VPCName != "" {
+	// First entry: mark the instance as creating before doing any work.
+	if inst.Status.Phase == "" {
+		inst.Status.Phase = dbaasv1.StatusCreating
+	}
+
+	// Skip if already done (either VPC mode or direct NAD mode)
+	if inst.Status.Resources.VPCName != "" || inst.Status.Resources.NADName != "" {
 		inst.Status.ProvisioningPhase = dbaasv1.PhaseNetworkProvisioned
 		return r.advance(ctx, inst)
 	}
 
+	// Direct NAD mode: use an existing Harvester VLAN NAD, skip VPC creation.
+	if inst.Spec.NetworkRef != "" {
+		inst.Status.Resources.NADName = inst.Spec.NetworkRef
+		inst.Status.ProvisioningPhase = dbaasv1.PhaseNetworkProvisioned
+		inst.Status.Message = fmt.Sprintf("Using existing network %s", inst.Spec.NetworkRef)
+		return r.advance(ctx, inst)
+	}
+
 	id := inst.Name
-	ns := inst.Status.Resources.Namespace
+	ns := inst.Namespace
 	consumerVLAN := inst.Spec.DBSubnetGroupName
 	if consumerVLAN == "" {
 		consumerVLAN = "10.50.0.0/24"
@@ -163,7 +152,7 @@ func (r *DBInstanceReconciler) phaseStorage(ctx context.Context, inst *dbaasv1.D
 	}
 
 	id := inst.Name
-	ns := inst.Status.Resources.Namespace
+	ns := inst.Namespace
 	storageType := inst.Spec.StorageType
 	if storageType == "" {
 		storageType = "longhorn"
@@ -188,7 +177,7 @@ func (r *DBInstanceReconciler) phaseVM(ctx context.Context, inst *dbaasv1.DBInst
 	}
 
 	id := inst.Name
-	ns := inst.Status.Resources.Namespace
+	ns := inst.Namespace
 
 	classSpec, ok := dbaasv1.InstanceClasses[inst.Spec.DBInstanceClass]
 	if !ok {
@@ -244,7 +233,7 @@ func (r *DBInstanceReconciler) phaseVM(ctx context.Context, inst *dbaasv1.DBInst
 }
 
 func (r *DBInstanceReconciler) phaseWaitReady(ctx context.Context, inst *dbaasv1.DBInstance) (ctrl.Result, error) {
-	ns := inst.Status.Resources.Namespace
+	ns := inst.Namespace
 
 	readiness, err := r.Harvester.GetVMIReadiness(ctx, ns, inst.Status.Resources.VMName)
 	if err != nil || !readiness.Running || readiness.IP == "" {
@@ -284,7 +273,7 @@ func (r *DBInstanceReconciler) phaseMonitoring(ctx context.Context, inst *dbaasv
 	}
 
 	id := inst.Name
-	ns := inst.Status.Resources.Namespace
+	ns := inst.Namespace
 
 	smName, grafanaURL, promTarget, err := r.Harvester.DeployMonitoring(ctx, id, ns, inst.Status.Endpoint.Address, inst.Status.Endpoint.Port)
 	if err != nil {
@@ -345,7 +334,7 @@ func (r *DBInstanceReconciler) phaseVpcPeering(ctx context.Context, inst *dbaasv
 // ============================================================
 
 func (r *DBInstanceReconciler) reconcileStop(ctx context.Context, inst *dbaasv1.DBInstance) (ctrl.Result, error) {
-	ns := inst.Status.Resources.Namespace
+	ns := inst.Namespace
 	inst.Status.Phase = dbaasv1.StatusStopping
 	inst.Status.Message = "Stopping VM"
 	_ = r.statusUpdate(ctx, inst)
@@ -361,7 +350,7 @@ func (r *DBInstanceReconciler) reconcileStop(ctx context.Context, inst *dbaasv1.
 }
 
 func (r *DBInstanceReconciler) reconcileStart(ctx context.Context, inst *dbaasv1.DBInstance) (ctrl.Result, error) {
-	ns := inst.Status.Resources.Namespace
+	ns := inst.Namespace
 	inst.Status.Phase = dbaasv1.StatusStarting
 	_ = r.statusUpdate(ctx, inst)
 
@@ -376,7 +365,7 @@ func (r *DBInstanceReconciler) reconcileStart(ctx context.Context, inst *dbaasv1
 }
 
 func (r *DBInstanceReconciler) reconcileModify(ctx context.Context, inst *dbaasv1.DBInstance) (ctrl.Result, error) {
-	ns := inst.Status.Resources.Namespace
+	ns := inst.Namespace
 	inst.Status.Phase = dbaasv1.StatusModifying
 	_ = r.statusUpdate(ctx, inst)
 
@@ -413,7 +402,7 @@ func (r *DBInstanceReconciler) reconcileModify(ctx context.Context, inst *dbaasv
 
 func (r *DBInstanceReconciler) reconcileDelete(ctx context.Context, inst *dbaasv1.DBInstance) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	ns := inst.Status.Resources.Namespace
+	ns := inst.Namespace
 
 	if inst.Spec.DeletionProtection {
 		inst.Status.Message = "Cannot delete: DeletionProtection is enabled"
@@ -425,15 +414,10 @@ func (r *DBInstanceReconciler) reconcileDelete(ctx context.Context, inst *dbaasv
 	inst.Status.Message = "Tearing down resources"
 	_ = r.statusUpdate(ctx, inst)
 
-	if ns != "" {
-		logger.Info("Deleting resources", "namespace", ns)
-		r.Harvester.TeardownAll(ctx, inst.Name, ns, inst.Status.Resources)
-		nsObj := &corev1.Namespace{}
-		nsObj.Name = ns
-		if err := r.Delete(ctx, nsObj); err != nil && !errors.IsNotFound(err) {
-			logger.Error(err, "failed to delete namespace", "namespace", ns)
-		}
-	}
+	logger.Info("Tearing down child resources", "namespace", ns)
+	r.Harvester.TeardownAll(ctx, inst.Name, ns, inst.Status.Resources)
+	// The tenant namespace is owned by the cluster operator (created during
+	// onboarding) — never delete it. We only remove the resources we created.
 
 	controllerutil.RemoveFinalizer(inst, dbaasv1.FinalizerName)
 	return ctrl.Result{}, r.Update(ctx, inst)

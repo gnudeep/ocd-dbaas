@@ -4,7 +4,7 @@ metadata:
   name: dbinstances.dbaas.wso2.com
 spec:
   group: dbaas.wso2.com
-  scope: Cluster
+  scope: Namespaced
   names:
     kind: DBInstance
     listKind: DBInstanceList

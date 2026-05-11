@@ -1,8 +1,11 @@
 package harvester
 
-import "fmt"
+import (
+	"encoding/base64"
+	"fmt"
+)
 
-func buildCloudInit(p VMCreateParams, adminPw, replPw, exporterPw, luksKey string) string {
+func buildCloudInit(p VMCreateParams, adminPw, replPw, exporterPw, luksKey string, tls *TLSBundle) string {
 	backupConfig := "# backups disabled"
 	if p.BackupEnabled && p.S3Config != nil {
 		backupConfig = fmt.Sprintf(
@@ -33,12 +36,17 @@ ssh_pwauth: true
 `, p.VMPassword)
 	}
 
+	caCertB64 := base64.StdEncoding.EncodeToString([]byte(tls.CACertPEM))
+	serverCertB64 := base64.StdEncoding.EncodeToString([]byte(tls.ServerCertPEM))
+	serverKeyB64 := base64.StdEncoding.EncodeToString([]byte(tls.ServerKeyPEM))
+
 	return fmt.Sprintf(`#cloud-config
 %spackage_update: true
 packages:
   - postgresql
   - postgresql-contrib
   - jq
+  - qemu-guest-agent
 write_files:
   - path: /etc/dbaas/bootstrap.env
     permissions: "0600"
@@ -64,6 +72,18 @@ write_files:
             dhcp4-overrides:
               use-routes: true
               route-metric: 200%s
+  - path: /etc/ssl/certs/pg-ca.crt
+    encoding: b64
+    permissions: "0644"
+    content: %s
+  - path: /etc/ssl/certs/pg-server.crt
+    encoding: b64
+    permissions: "0644"
+    content: %s
+  - path: /etc/ssl/private/pg-server.key
+    encoding: b64
+    permissions: "0600"
+    content: %s
   - path: /etc/dbaas/bootstrap.sh
     permissions: "0700"
     content: |
@@ -74,14 +94,23 @@ write_files:
       PG_VER=$(pg_lsclusters -h | awk '{print $1}' | head -1)
       PG_CONF="/etc/postgresql/${PG_VER}/main"
 
+      # Fix server key ownership now that postgres user exists
+      chown postgres:postgres /etc/ssl/private/pg-server.key
+
       # Listen on all interfaces and set the port
       sed -i "s/^#\?listen_addresses.*/listen_addresses = '*'/" "${PG_CONF}/postgresql.conf"
       sed -i "s/^#\?port.*/port = ${DB_PORT}/" "${PG_CONF}/postgresql.conf"
       sed -i "s/^#\?max_connections.*/max_connections = ${MAX_CONNECTIONS}/" "${PG_CONF}/postgresql.conf"
 
-      # Allow remote connections with scram-sha-256
-      echo "host all all 0.0.0.0/0 scram-sha-256" >> "${PG_CONF}/pg_hba.conf"
-      echo "host replication all 0.0.0.0/0 scram-sha-256" >> "${PG_CONF}/pg_hba.conf"
+      # Enable SSL
+      sed -i "s/^#\?ssl\b.*/ssl = on/" "${PG_CONF}/postgresql.conf"
+      sed -i "s|^#\?ssl_cert_file.*|ssl_cert_file = '/etc/ssl/certs/pg-server.crt'|" "${PG_CONF}/postgresql.conf"
+      sed -i "s|^#\?ssl_key_file.*|ssl_key_file = '/etc/ssl/private/pg-server.key'|" "${PG_CONF}/postgresql.conf"
+      sed -i "s|^#\?ssl_ca_file.*|ssl_ca_file = '/etc/ssl/certs/pg-ca.crt'|" "${PG_CONF}/postgresql.conf"
+
+      # SSL-only remote connections (hostssl rejects plain-text clients)
+      echo "hostssl all all 0.0.0.0/0 scram-sha-256" >> "${PG_CONF}/pg_hba.conf"
+      echo "hostssl replication all 0.0.0.0/0 scram-sha-256" >> "${PG_CONF}/pg_hba.conf"
 
       systemctl restart postgresql
 
@@ -90,13 +119,14 @@ write_files:
       DO \$\$
       BEGIN
         IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${MASTER_USER}') THEN
-          CREATE ROLE ${MASTER_USER} LOGIN SUPERUSER PASSWORD '${MASTER_PASSWORD}';
+cre          CREATE ROLE ${MASTER_USER} LOGIN SUPERUSER PASSWORD '${MASTER_PASSWORD}';
         END IF;
       END \$\$;
       SELECT 'CREATE DATABASE ${DB_NAME} OWNER ${MASTER_USER}'
         WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${DB_NAME}')\gexec
       EOSQL
 runcmd:
+  - systemctl enable --now qemu-guest-agent
   - netplan apply
   - mkdir -p /var/lib/dbaas
   - chown postgres:postgres /var/lib/dbaas
@@ -115,6 +145,9 @@ final_message: "DBaaS bootstrap complete for %s"
 		luksKey,
 		backupConfig,
 		consumerNetplan,
+		caCertB64,
+		serverCertB64,
+		serverKeyB64,
 		p.ID,
 	)
 }

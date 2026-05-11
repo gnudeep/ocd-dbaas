@@ -92,7 +92,7 @@ func (r *DBInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	case dbaasv1.PhaseVpcPeeringCreated:
 		return r.phaseAvailable(ctx, &inst)
 	case dbaasv1.PhaseAvailable:
-		return ctrl.Result{}, nil // fully reconciled
+		return r.phaseAvailable(ctx, &inst)
 	case dbaasv1.PhaseFailed:
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	default:
@@ -197,7 +197,7 @@ func (r *DBInstanceReconciler) phaseVM(ctx context.Context, inst *dbaasv1.DBInst
 		osImage = "ubuntu-22.04-server-cloudimg-amd64.img"
 	}
 
-	vmName, secretName, err := r.Harvester.CreatePostgresVM(ctx, harvester.VMCreateParams{
+	vmName, secretName, caCertPEM, err := r.Harvester.CreatePostgresVM(ctx, harvester.VMCreateParams{
 		ID:             id,
 		Namespace:      ns,
 		CPUCores:       classSpec.CPUCores,
@@ -222,6 +222,7 @@ func (r *DBInstanceReconciler) phaseVM(ctx context.Context, inst *dbaasv1.DBInst
 
 	inst.Status.Resources.VMName = vmName
 	inst.Status.Resources.SecretName = secretName
+	inst.Status.CACertPEM = caCertPEM
 	inst.Status.MasterUserSecret = &dbaasv1.MasterUserSecretRef{
 		Name:   secretName,
 		Status: dbaasv1.SecretStatusActive,
@@ -258,7 +259,7 @@ func (r *DBInstanceReconciler) phaseWaitReady(ctx context.Context, inst *dbaasv1
 	inst.Status.Endpoint = &dbaasv1.Endpoint{
 		Address: readiness.IP,
 		Port:    port,
-		JDBCURL: fmt.Sprintf("jdbc:postgresql://%s:%d/%s?ssl=true&sslmode=verify-full", readiness.IP, port, dbName),
+		JDBCURL: fmt.Sprintf("jdbc:postgresql://%s:%d/%s?ssl=true&sslmode=verify-ca", readiness.IP, port, dbName),
 	}
 	inst.Status.ProvisioningPhase = dbaasv1.PhaseDatabaseReady
 	inst.Status.Message = "PostgreSQL is ready"
@@ -296,7 +297,24 @@ func (r *DBInstanceReconciler) phaseAvailable(ctx context.Context, inst *dbaasv1
 	inst.Status.ObservedGeneration = inst.Generation
 	inst.Status.Message = "Database instance is available"
 
-	return ctrl.Result{}, r.statusUpdate(ctx, inst)
+	// Re-check the vpc-net IP on every requeue — the guest agent may report it
+	// later than initial readiness, or it can change after a VM restart.
+	readiness, _ := r.Harvester.GetVMIReadiness(ctx, inst.Namespace, inst.Status.Resources.VMName)
+	if readiness.IP != "" && (inst.Status.Endpoint == nil || inst.Status.Endpoint.Address != readiness.IP) {
+		port := specPort(inst.Spec.Port)
+		dbName := inst.Spec.DBName
+		if dbName == "" {
+			dbName = inst.Name
+		}
+		inst.Status.Endpoint = &dbaasv1.Endpoint{
+			Address: readiness.IP,
+			Port:    port,
+			JDBCURL: fmt.Sprintf("jdbc:postgresql://%s:%d/%s?ssl=true&sslmode=verify-ca", readiness.IP, port, dbName),
+		}
+		log.FromContext(ctx).Info("endpoint updated", "ip", readiness.IP)
+	}
+
+	return ctrl.Result{RequeueAfter: 60 * time.Second}, r.statusUpdate(ctx, inst)
 }
 
 func (r *DBInstanceReconciler) phaseVpcPeering(ctx context.Context, inst *dbaasv1.DBInstance) (ctrl.Result, error) {

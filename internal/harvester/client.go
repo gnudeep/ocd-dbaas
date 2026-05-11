@@ -248,7 +248,7 @@ func (c *Client) resolveVMImage(ctx context.Context, ref string) (ns, name, sc s
 	return
 }
 
-func (c *Client) CreatePostgresVM(ctx context.Context, p VMCreateParams) (vmName, secretName string, err error) {
+func (c *Client) CreatePostgresVM(ctx context.Context, p VMCreateParams) (vmName, secretName, caCertPEM string, err error) {
 	vmName = fmt.Sprintf("pg-%s", p.ID)
 	secretName = fmt.Sprintf("pg-%s-credentials", p.ID)
 
@@ -258,8 +258,17 @@ func (c *Client) CreatePostgresVM(ctx context.Context, p VMCreateParams) (vmName
 	exporterPw := randomString(24)
 	luksKey := randomString(64)
 
+	// Generate per-instance TLS: ephemeral CA + server cert signed by that CA.
+	// CA key is stored in the Secret alongside DB credentials (same threat model).
+	tls, tlsErr := generateTLS(vmName)
+	if tlsErr != nil {
+		err = fmt.Errorf("TLS generation: %w", tlsErr)
+		return
+	}
+	caCertPEM = tls.CACertPEM
+
 	// Store credentials and cloud-init in K8s Secret
-	cloudInit := buildCloudInit(p, adminPw, replPw, exporterPw, luksKey)
+	cloudInit := buildCloudInit(p, adminPw, replPw, exporterPw, luksKey, tls)
 	secret := newUnstructured("v1", "Secret", secretName, p.Namespace)
 	_ = unstructured.SetNestedField(secret.Object, "Opaque", "type")
 	_ = unstructured.SetNestedField(secret.Object, map[string]interface{}{
@@ -268,6 +277,10 @@ func (c *Client) CreatePostgresVM(ctx context.Context, p VMCreateParams) (vmName
 		"repl_password":     replPw,
 		"exporter_password": exporterPw,
 		"luks_key":          luksKey,
+		"ca_cert":           tls.CACertPEM,
+		"ca_key":            tls.CAKeyPEM,
+		"server_cert":       tls.ServerCertPEM,
+		"server_key":        tls.ServerKeyPEM,
 		"userdata":          cloudInit, // referenced by VM spec; avoids plain-text in VM CR
 	}, "stringData")
 	if _, e := c.Dynamic.Resource(secretGVR).Namespace(p.Namespace).Create(ctx, secret, metav1.CreateOptions{}); e != nil {
@@ -350,7 +363,7 @@ func (c *Client) CreatePostgresVM(ctx context.Context, p VMCreateParams) (vmName
 	if _, e := c.Dynamic.Resource(vmGVR).Namespace(p.Namespace).Create(ctx, vm, metav1.CreateOptions{}); e != nil {
 		err = ignoreAlreadyExists(e)
 	}
-	return
+	return // vmName, secretName, caCertPEM, err all set via named returns
 }
 
 // GetVMIReadiness fetches the VMI once and returns phase, IP, and postgres-readiness.
@@ -365,15 +378,30 @@ func (c *Client) GetVMIReadiness(ctx context.Context, ns, vmName string) (VMIRea
 
 	var ip string
 	interfaces, _, _ := unstructured.NestedSlice(vmi.Object, "status", "interfaces")
+	// Prefer vpc-net (Multus bridge) over mgmt-net (pod masquerade).
+	// KubeVirt lists masquerade first, so we scan all interfaces and pick
+	// vpc-net explicitly; fall back to the first address if not found.
+	var fallbackIP string
 	for _, iface := range interfaces {
 		ifMap, ok := iface.(map[string]interface{})
 		if !ok {
 			continue
 		}
-		if addr, ok := ifMap["ipAddress"].(string); ok && addr != "" {
+		addr, _ := ifMap["ipAddress"].(string)
+		if addr == "" {
+			continue
+		}
+		name, _ := ifMap["name"].(string)
+		if name == "vpc-net" {
 			ip = addr
 			break
 		}
+		if fallbackIP == "" {
+			fallbackIP = addr
+		}
+	}
+	if ip == "" {
+		ip = fallbackIP
 	}
 
 	ready := running && time.Since(vmi.GetCreationTimestamp().Time) > 3*time.Minute
@@ -389,6 +417,25 @@ func (c *Client) setVMRunning(ctx context.Context, ns, vmName string, running bo
 	_ = unstructured.SetNestedField(vm.Object, running, "spec", "running")
 	_, err = c.Dynamic.Resource(vmGVR).Namespace(ns).Update(ctx, vm, metav1.UpdateOptions{})
 	return err
+}
+
+// GetSecret returns the Secret's data map (values are raw bytes).
+func (c *Client) GetSecret(ctx context.Context, ns, name string) (map[string][]byte, error) {
+	obj, err := c.Dynamic.Resource(secretGVR).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	rawData, _, _ := unstructured.NestedMap(obj.Object, "data")
+	out := make(map[string][]byte, len(rawData))
+	for k, v := range rawData {
+		if s, ok := v.(string); ok {
+			decoded, err := base64.StdEncoding.DecodeString(s)
+			if err == nil {
+				out[k] = decoded
+			}
+		}
+	}
+	return out, nil
 }
 
 func (c *Client) StopVM(ctx context.Context, ns, vmName string) error {

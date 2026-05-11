@@ -1,0 +1,71 @@
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: db-test-client
+  namespace: ssl-test
+spec:
+  running: true
+  dataVolumeTemplates:
+    - apiVersion: cdi.kubevirt.io/v1beta1
+      kind: DataVolume
+      metadata:
+        name: db-test-client-disk
+        annotations:
+          # Harvester clones this image into the blank volume at boot
+          harvesterhci.io/imageId: default/image-8hdn4
+      spec:
+        source:
+          blank: {}
+        pvc:
+          storageClassName: longhorn-image-8hdn4
+          accessModes:
+            - ReadWriteMany
+          volumeMode: Block
+          resources:
+            requests:
+              storage: 10Gi
+  template:
+    metadata:
+      labels:
+        kubevirt.io/vm: db-test-client
+    spec:
+      domain:
+        cpu:
+          cores: 1
+        memory:
+          guest: 1Gi
+        devices:
+          disks:
+            - name: rootdisk
+              disk:
+                bus: virtio
+            - name: cloudinitdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: vpc-net
+              bridge: {}
+      networks:
+        - name: vpc-net
+          multus:
+            networkName: iaas/vm-network-001
+      volumes:
+        - name: rootdisk
+          dataVolume:
+            name: db-test-client-disk
+        - name: cloudinitdisk
+          cloudInitNoCloud:
+            userData: |
+              #cloud-config
+              package_update: true
+              packages:
+                - postgresql-client
+                - qemu-guest-agent
+              ssh_pwauth: true
+              chpasswd:
+                list: |
+                  ubuntu:Test1234!
+                expire: false
+              runcmd:
+                - systemctl enable --now qemu-guest-agent
+              final_message: "Test client VM ready"

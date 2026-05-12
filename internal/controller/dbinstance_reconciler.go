@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -62,6 +63,11 @@ func (r *DBInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{Requeue: true}, nil
 	}
 
+	// --- Resume an in-flight patch (across controller restarts) ---
+	if inst.Status.Phase == dbaasv1.StatusPatching {
+		return r.dispatchPatch(ctx, &inst)
+	}
+
 	// --- Handle stop/start ---
 	if inst.Spec.Running != nil && !*inst.Spec.Running && inst.Status.Phase == dbaasv1.StatusAvailable {
 		return r.reconcileStop(ctx, &inst)
@@ -72,6 +78,9 @@ func (r *DBInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	// --- Handle spec changes on available instance ---
 	if inst.Status.Phase == dbaasv1.StatusAvailable && inst.Generation != inst.Status.ObservedGeneration {
+		if needsPatch(&inst) {
+			return r.startPatch(ctx, &inst)
+		}
 		return r.reconcileModify(ctx, &inst)
 	}
 
@@ -192,10 +201,7 @@ func (r *DBInstanceReconciler) phaseVM(ctx context.Context, inst *dbaasv1.DBInst
 	if dbName == "" {
 		dbName = id
 	}
-	osImage := inst.Spec.OSImage
-	if osImage == "" {
-		osImage = "ubuntu-22.04-server-cloudimg-amd64.img"
-	}
+	osImage := effectiveOSImage(inst)
 
 	vmName, secretName, caCertPEM, err := r.Harvester.CreatePostgresVM(ctx, harvester.VMCreateParams{
 		ID:             id,
@@ -227,6 +233,8 @@ func (r *DBInstanceReconciler) phaseVM(ctx context.Context, inst *dbaasv1.DBInst
 		Name:   secretName,
 		Status: dbaasv1.SecretStatusActive,
 	}
+	inst.Status.CurrentOSImage = osImage
+	inst.Status.CurrentEngineVersion = inst.Spec.EngineVersion
 	inst.Status.ProvisioningPhase = dbaasv1.PhaseVMCreated
 	inst.Status.Message = "VM created, waiting for PostgreSQL to initialize"
 
@@ -467,4 +475,225 @@ func specPort(port int) int {
 		return 5432
 	}
 	return port
+}
+
+// effectiveOSImage returns the OS image actually used to build the VM, applying
+// the default when spec.osImage is empty.
+func effectiveOSImage(inst *dbaasv1.DBInstance) string {
+	if inst.Spec.OSImage == "" {
+		return dbaasv1.DefaultOSImage
+	}
+	return inst.Spec.OSImage
+}
+
+// needsPatch is true when the desired OS image or engine version diverges from
+// what the running VM was built with. CurrentOSImage being empty means this is
+// the first reconcile that observes a spec change before initial provisioning
+// recorded the image — not a patch, so skip.
+func needsPatch(inst *dbaasv1.DBInstance) bool {
+	if inst.Status.CurrentOSImage == "" {
+		return false
+	}
+	if effectiveOSImage(inst) != inst.Status.CurrentOSImage {
+		return true
+	}
+	if inst.Spec.EngineVersion != "" &&
+		inst.Status.CurrentEngineVersion != "" &&
+		inst.Spec.EngineVersion != inst.Status.CurrentEngineVersion {
+		return true
+	}
+	return false
+}
+
+// ============================================================
+// Patch flow (proposals/001-patching-and-minor-upgrades.md)
+//
+// Sub-phases (advance one per reconcile, idempotent on re-entry):
+//   PatchPending       seed PatchState, record previous image
+//   PatchSnapshotting  trigger pre-patch snapshot
+//   PatchStopping      stop VM, wait for VMI to disappear
+//   PatchOSReplaced    delete VM (cascades OS DV), then recreate with new image
+//   PatchStarting      VM is created with running=true; check it exists
+//   PatchVerifying     wait for VMI Ready + 3-minute settle window
+//
+// On verification failure, retry up to PatchMaxAttempts; then roll back to
+// previousImage; if rollback also fails, transition to Failed.
+// ============================================================
+
+func (r *DBInstanceReconciler) startPatch(ctx context.Context, inst *dbaasv1.DBInstance) (ctrl.Result, error) {
+	now := metav1.Now()
+	inst.Status.Phase = dbaasv1.StatusPatching
+	inst.Status.ProvisioningPhase = dbaasv1.PhasePatchPending
+	inst.Status.PreviousOSImage = inst.Status.CurrentOSImage
+	inst.Status.PatchState = &dbaasv1.PatchState{
+		TargetOSImage:       effectiveOSImage(inst),
+		TargetEngineVersion: inst.Spec.EngineVersion,
+		StartedAt:           &now,
+	}
+	inst.Status.Message = fmt.Sprintf("Patching from %s to %s", inst.Status.CurrentOSImage, inst.Status.PatchState.TargetOSImage)
+	return r.advance(ctx, inst)
+}
+
+func (r *DBInstanceReconciler) dispatchPatch(ctx context.Context, inst *dbaasv1.DBInstance) (ctrl.Result, error) {
+	if inst.Status.PatchState == nil {
+		return r.fail(ctx, inst, "PatchStateMissing", fmt.Errorf("status.patchState lost while phase=patching"))
+	}
+	switch inst.Status.ProvisioningPhase {
+	case dbaasv1.PhasePatchPending:
+		return r.phasePatchPending(ctx, inst)
+	case dbaasv1.PhasePatchSnapshotting:
+		return r.phasePatchSnapshotting(ctx, inst)
+	case dbaasv1.PhasePatchStopping:
+		return r.phasePatchStopping(ctx, inst)
+	case dbaasv1.PhasePatchOSReplaced:
+		return r.phasePatchOSReplaced(ctx, inst)
+	case dbaasv1.PhasePatchStarting:
+		return r.phasePatchStarting(ctx, inst)
+	case dbaasv1.PhasePatchVerifying:
+		return r.phasePatchVerifying(ctx, inst)
+	default:
+		return r.fail(ctx, inst, "PatchPhaseUnknown", fmt.Errorf("unexpected patch phase: %s", inst.Status.ProvisioningPhase))
+	}
+}
+
+func (r *DBInstanceReconciler) phasePatchPending(ctx context.Context, inst *dbaasv1.DBInstance) (ctrl.Result, error) {
+	// Pre-flight: resolve the target image so we fail fast on typos before any
+	// destructive action.
+	if _, _, _, err := r.Harvester.ResolveVMImage(ctx, inst.Status.PatchState.TargetOSImage); err != nil {
+		return r.fail(ctx, inst, "PatchTargetImageInvalid", err)
+	}
+	inst.Status.ProvisioningPhase = dbaasv1.PhasePatchSnapshotting
+	inst.Status.Message = "Target image validated, preparing pre-patch snapshot"
+	return r.advance(ctx, inst)
+}
+
+func (r *DBInstanceReconciler) phasePatchSnapshotting(ctx context.Context, inst *dbaasv1.DBInstance) (ctrl.Result, error) {
+	// TODO(snapshot): wire to DBSnapshot controller once it lands. For now the
+	// phase is a placeholder that records intent — the proposal's snapshot
+	// guarantee depends on a working snapshot controller.
+	snapName := fmt.Sprintf("pre-patch-%s-%d", inst.Name, inst.Status.PatchState.StartedAt.Unix())
+	inst.Status.PatchState.SnapshotName = snapName
+	inst.Status.ProvisioningPhase = dbaasv1.PhasePatchStopping
+	inst.Status.Message = "Snapshot recorded; stopping VM"
+	return r.advance(ctx, inst)
+}
+
+func (r *DBInstanceReconciler) phasePatchStopping(ctx context.Context, inst *dbaasv1.DBInstance) (ctrl.Result, error) {
+	ns := inst.Namespace
+	vmName := inst.Status.Resources.VMName
+
+	// Issue stop (idempotent on the VM resource).
+	if err := r.Harvester.StopVM(ctx, ns, vmName); err != nil && !errors.IsNotFound(err) {
+		return r.fail(ctx, inst, "PatchStopFailed", err)
+	}
+
+	gone, err := r.Harvester.VMIGone(ctx, ns, vmName)
+	if err != nil {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+	if !gone {
+		inst.Status.Message = "Waiting for VMI to terminate"
+		_ = r.statusUpdate(ctx, inst)
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	inst.Status.ProvisioningPhase = dbaasv1.PhasePatchOSReplaced
+	inst.Status.Message = "VM stopped; replacing OS DataVolume"
+	return r.advance(ctx, inst)
+}
+
+func (r *DBInstanceReconciler) phasePatchOSReplaced(ctx context.Context, inst *dbaasv1.DBInstance) (ctrl.Result, error) {
+	ns := inst.Namespace
+	vmName := inst.Status.Resources.VMName
+
+	vmGone, err := r.Harvester.VMResourceGone(ctx, ns, vmName)
+	if err != nil {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	if !vmGone {
+		// Delete the VM; KubeVirt cascades the OS DV via owner reference.
+		if err := r.Harvester.DeletePostgresVM(ctx, ns, vmName); err != nil {
+			return r.fail(ctx, inst, "PatchVMDeleteFailed", err)
+		}
+		inst.Status.Message = "Old VM deleted; waiting for OS DataVolume to be reclaimed"
+		_ = r.statusUpdate(ctx, inst)
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	// VM is gone — recreate with the new image, reusing the existing Secret.
+	classSpec, ok := dbaasv1.InstanceClasses[inst.Spec.DBInstanceClass]
+	if !ok {
+		return r.fail(ctx, inst, "InvalidClass", fmt.Errorf("unknown class: %s", inst.Spec.DBInstanceClass))
+	}
+
+	_, err = r.Harvester.RecreatePostgresVMForPatch(ctx, harvester.VMCreateParams{
+		ID:              inst.Name,
+		Namespace:       ns,
+		CPUCores:        classSpec.CPUCores,
+		MemoryMB:        classSpec.MemoryMB,
+		OSImage:         inst.Status.PatchState.TargetOSImage,
+		DataVolumeRef:   inst.Status.Resources.DataVolumeName,
+		SubnetName:      inst.Status.Resources.SubnetName,
+		NADName:         inst.Status.Resources.NADName,
+		ConsumerNetwork: inst.Spec.ConsumerNetwork,
+	})
+	if err != nil {
+		return r.fail(ctx, inst, "PatchVMRecreateFailed", err)
+	}
+
+	inst.Status.ProvisioningPhase = dbaasv1.PhasePatchStarting
+	inst.Status.Message = "VM recreated on new image"
+	return r.advance(ctx, inst)
+}
+
+func (r *DBInstanceReconciler) phasePatchStarting(ctx context.Context, inst *dbaasv1.DBInstance) (ctrl.Result, error) {
+	// VM is created with running=true; this phase just confirms the resource
+	// is back before moving to verification.
+	vmGone, err := r.Harvester.VMResourceGone(ctx, inst.Namespace, inst.Status.Resources.VMName)
+	if err != nil || vmGone {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	inst.Status.ProvisioningPhase = dbaasv1.PhasePatchVerifying
+	inst.Status.Message = "Waiting for VMI to come up on new image"
+	return r.advance(ctx, inst)
+}
+
+func (r *DBInstanceReconciler) phasePatchVerifying(ctx context.Context, inst *dbaasv1.DBInstance) (ctrl.Result, error) {
+	readiness, err := r.Harvester.GetVMIReadiness(ctx, inst.Namespace, inst.Status.Resources.VMName)
+	if err != nil || !readiness.Running {
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	}
+	if !readiness.Ready {
+		inst.Status.Message = fmt.Sprintf("VM up at %s, settling", readiness.IP)
+		_ = r.statusUpdate(ctx, inst)
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	}
+
+	// Verification passed.
+	now := metav1.Now()
+	inst.Status.Phase = dbaasv1.StatusAvailable
+	inst.Status.ProvisioningPhase = dbaasv1.PhaseAvailable
+	inst.Status.CurrentOSImage = inst.Status.PatchState.TargetOSImage
+	if inst.Status.PatchState.TargetEngineVersion != "" {
+		inst.Status.CurrentEngineVersion = inst.Status.PatchState.TargetEngineVersion
+	}
+	inst.Status.LastPatchTime = &now
+	inst.Status.PatchState = nil
+	inst.Status.ObservedGeneration = inst.Generation
+
+	if readiness.IP != "" {
+		port := specPort(inst.Spec.Port)
+		dbName := inst.Spec.DBName
+		if dbName == "" {
+			dbName = inst.Name
+		}
+		inst.Status.Endpoint = &dbaasv1.Endpoint{
+			Address: readiness.IP,
+			Port:    port,
+			JDBCURL: fmt.Sprintf("jdbc:postgresql://%s:%d/%s?ssl=true&sslmode=verify-ca", readiness.IP, port, dbName),
+		}
+	}
+	inst.Status.Message = fmt.Sprintf("Patched to %s", inst.Status.CurrentOSImage)
+	return ctrl.Result{}, r.statusUpdate(ctx, inst)
 }

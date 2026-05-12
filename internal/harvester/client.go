@@ -199,6 +199,12 @@ func (c *Client) ResizeDataVolume(ctx context.Context, ns, dvName string, newSiz
 // VM: KubeVirt VirtualMachine + cloud-init + credentials Secret
 // ============================================================
 
+// ResolveVMImage is the public wrapper around resolveVMImage. Used by the
+// patch flow to validate a target image before any destructive action.
+func (c *Client) ResolveVMImage(ctx context.Context, ref string) (ns, name, sc string, err error) {
+	return c.resolveVMImage(ctx, ref)
+}
+
 // resolveVMImage maps a user-supplied image reference to the underlying
 // Harvester VirtualMachineImage and its image-managed StorageClass.
 //
@@ -444,6 +450,120 @@ func (c *Client) StopVM(ctx context.Context, ns, vmName string) error {
 
 func (c *Client) StartVM(ctx context.Context, ns, vmName string) error {
 	return c.setVMRunning(ctx, ns, vmName, true)
+}
+
+// DeletePostgresVM deletes the VM resource. The OS DataVolume is in the VM's
+// dataVolumeTemplates, so it is garbage-collected via owner reference. The
+// pgdata DataVolume is created standalone (CreateDataVolume) and survives.
+func (c *Client) DeletePostgresVM(ctx context.Context, ns, vmName string) error {
+	err := c.Dynamic.Resource(vmGVR).Namespace(ns).Delete(ctx, vmName, metav1.DeleteOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
+// VMResourceGone returns true if the VM resource (and its OS DV) is absent.
+func (c *Client) VMResourceGone(ctx context.Context, ns, vmName string) (bool, error) {
+	_, err := c.Dynamic.Resource(vmGVR).Namespace(ns).Get(ctx, vmName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return true, nil
+	}
+	return false, err
+}
+
+// VMIGone returns true if the VMI is absent (VM stopped or deleted).
+func (c *Client) VMIGone(ctx context.Context, ns, vmName string) (bool, error) {
+	_, err := c.Dynamic.Resource(vmiGVR).Namespace(ns).Get(ctx, vmName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return true, nil
+	}
+	return false, err
+}
+
+// RecreatePostgresVMForPatch creates a VM that reuses the existing credentials
+// Secret (preserving cloud-init userdata, LUKS key, and TLS bundle) but pulls
+// its OS DataVolume from a different VirtualMachineImage. Used during the
+// patch flow after the prior VM has been deleted.
+//
+// Preconditions: the credentials Secret pg-<id>-credentials must already exist
+// in the namespace, and no VM resource named pg-<id> may exist.
+func (c *Client) RecreatePostgresVMForPatch(ctx context.Context, p VMCreateParams) (vmName string, err error) {
+	vmName = fmt.Sprintf("pg-%s", p.ID)
+	secretName := fmt.Sprintf("pg-%s-credentials", p.ID)
+
+	imgNs, imgName, imgSC, err := c.resolveVMImage(ctx, p.OSImage)
+	if err != nil {
+		return
+	}
+
+	vm := newUnstructured("kubevirt.io/v1", "VirtualMachine", vmName, p.Namespace)
+	vm.SetLabels(map[string]string{dbaasv1.LabelInstance: p.ID, dbaasv1.LabelRole: "primary"})
+
+	spec := map[string]interface{}{
+		"running": true,
+		"dataVolumeTemplates": []interface{}{
+			map[string]interface{}{
+				"apiVersion": "cdi.kubevirt.io/v1beta1",
+				"kind":       "DataVolume",
+				"metadata": map[string]interface{}{
+					"name": fmt.Sprintf("pg-%s-os", p.ID),
+					"annotations": map[string]interface{}{
+						"harvesterhci.io/imageId": fmt.Sprintf("%s/%s", imgNs, imgName),
+					},
+				},
+				"spec": map[string]interface{}{
+					"source": map[string]interface{}{
+						"blank": map[string]interface{}{},
+					},
+					"pvc": map[string]interface{}{
+						"accessModes":      []interface{}{"ReadWriteMany"},
+						"volumeMode":       "Block",
+						"storageClassName": imgSC,
+						"resources": map[string]interface{}{
+							"requests": map[string]interface{}{"storage": "20Gi"},
+						},
+					},
+				},
+			},
+		},
+		"template": map[string]interface{}{
+			"metadata": map[string]interface{}{
+				"labels": map[string]interface{}{dbaasv1.LabelInstance: p.ID},
+				"annotations": map[string]interface{}{
+					"ovn.kubernetes.io/logical_switch": p.SubnetName,
+				},
+			},
+			"spec": map[string]interface{}{
+				"domain": map[string]interface{}{
+					"cpu":    map[string]interface{}{"cores": int64(p.CPUCores), "sockets": int64(1), "threads": int64(1)},
+					"memory": map[string]interface{}{"guest": fmt.Sprintf("%dMi", p.MemoryMB)},
+					"devices": map[string]interface{}{
+						"disks": []interface{}{
+							map[string]interface{}{"name": "os-disk", "disk": map[string]interface{}{"bus": "virtio"}, "bootOrder": int64(1)},
+							map[string]interface{}{"name": "pgdata-disk", "disk": map[string]interface{}{"bus": "virtio"}},
+							map[string]interface{}{"name": "cloudinit", "disk": map[string]interface{}{"bus": "virtio"}},
+						},
+						"interfaces": vmInterfaces(p.ConsumerNetwork),
+					},
+				},
+				"networks": vmNetworks(p.Namespace, p.NADName, p.ConsumerNetwork),
+				"volumes": []interface{}{
+					map[string]interface{}{"name": "os-disk", "dataVolume": map[string]interface{}{"name": fmt.Sprintf("pg-%s-os", p.ID)}},
+					map[string]interface{}{"name": "pgdata-disk", "dataVolume": map[string]interface{}{"name": p.DataVolumeRef}},
+					map[string]interface{}{"name": "cloudinit", "cloudInitNoCloud": map[string]interface{}{
+						"secretRef": map[string]interface{}{"name": secretName},
+					}},
+				},
+			},
+		},
+	}
+	_ = unstructured.SetNestedField(vm.Object, spec, "spec")
+
+	if _, e := c.Dynamic.Resource(vmGVR).Namespace(p.Namespace).Create(ctx, vm, metav1.CreateOptions{}); e != nil {
+		err = ignoreAlreadyExists(e)
+	}
+	return
 }
 
 // ResizeVM updates CPU/memory on the VM spec.

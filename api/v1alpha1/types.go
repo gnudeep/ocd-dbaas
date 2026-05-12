@@ -164,6 +164,35 @@ type DBInstanceStatus struct {
 
 	// ObservedGeneration tracks which spec version has been reconciled.
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// CurrentOSImage records the image the running OS DataVolume was built
+	// from. Set when provisioning completes and after every successful patch.
+	// Compared against spec.osImage to detect a needed patch.
+	CurrentOSImage string `json:"currentOSImage,omitempty"`
+
+	// CurrentEngineVersion records the running PostgreSQL major version.
+	CurrentEngineVersion string `json:"currentEngineVersion,omitempty"`
+
+	// PreviousOSImage is the image in use before the in-flight patch began.
+	// Used as the rollback target if verification fails.
+	PreviousOSImage string `json:"previousOSImage,omitempty"`
+
+	// LastPatchTime is when the most recent successful patch completed.
+	LastPatchTime *metav1.Time `json:"lastPatchTime,omitempty"`
+
+	// PatchState is non-nil while a patch is in progress. Persists the target
+	// image and attempt count so the controller can resume after a restart.
+	PatchState *PatchState `json:"patchState,omitempty"`
+}
+
+// PatchState captures in-flight patch progress so a restarted controller can
+// resume the same operation.
+type PatchState struct {
+	TargetOSImage       string       `json:"targetOSImage,omitempty"`
+	TargetEngineVersion string       `json:"targetEngineVersion,omitempty"`
+	SnapshotName        string       `json:"snapshotName,omitempty"`
+	StartedAt           *metav1.Time `json:"startedAt,omitempty"`
+	AttemptCount        int          `json:"attemptCount,omitempty"`
 }
 
 type Endpoint struct {
@@ -277,6 +306,14 @@ const (
 	PhaseAvailable           = "Available"
 	PhaseFailed              = "Failed"
 
+	// Patch sub-phases (see proposals/001-patching-and-minor-upgrades.md)
+	PhasePatchPending      = "PatchPending"
+	PhasePatchSnapshotting = "PatchSnapshotting"
+	PhasePatchStopping     = "PatchStopping"
+	PhasePatchOSReplaced   = "PatchOSReplaced"
+	PhasePatchStarting     = "PatchStarting"
+	PhasePatchVerifying    = "PatchVerifying"
+
 	// Status.Phase values (RDS-compatible lowercase strings)
 	StatusCreating  = "creating"
 	StatusAvailable = "available"
@@ -284,8 +321,15 @@ const (
 	StatusStopped   = "stopped"
 	StatusStarting  = "starting"
 	StatusModifying = "modifying"
+	StatusPatching  = "patching"
 	StatusDeleting  = "deleting"
 	StatusFailed    = "failed"
+
+	// DefaultOSImage is used when spec.osImage is unset.
+	DefaultOSImage = "ubuntu-22.04-server-cloudimg-amd64.img"
+
+	// PatchMaxAttempts caps verification retries before switching to rollback.
+	PatchMaxAttempts = 2
 
 	// MasterUserSecretRef.Status values
 	SecretStatusActive   = "active"

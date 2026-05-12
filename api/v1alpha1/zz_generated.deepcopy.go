@@ -122,6 +122,32 @@ func (in *DBInstanceStatus) DeepCopyInto(out *DBInstanceStatus) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
+	if in.LastPatchTime != nil {
+		in, out := &in.LastPatchTime, &out.LastPatchTime
+		*out = (*in).DeepCopy()
+	}
+	if in.PatchState != nil {
+		in, out := &in.PatchState, &out.PatchState
+		*out = new(PatchState)
+		(*in).DeepCopyInto(*out)
+	}
+}
+
+func (in *PatchState) DeepCopyInto(out *PatchState) {
+	*out = *in
+	if in.StartedAt != nil {
+		in, out := &in.StartedAt, &out.StartedAt
+		*out = (*in).DeepCopy()
+	}
+}
+
+func (in *PatchState) DeepCopy() *PatchState {
+	if in == nil {
+		return nil
+	}
+	out := new(PatchState)
+	in.DeepCopyInto(out)
+	return out
 }
 
 func (in *DBInstanceStatus) DeepCopy() *DBInstanceStatus {

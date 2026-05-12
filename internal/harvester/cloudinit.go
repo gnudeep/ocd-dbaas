@@ -45,6 +45,7 @@ ssh_pwauth: true
 packages:
   - postgresql
   - postgresql-contrib
+  - cryptsetup-bin
   - jq
   - qemu-guest-agent
 write_files:
@@ -93,43 +94,76 @@ write_files:
 
       PG_VER=$(pg_lsclusters -h | awk '{print $1}' | head -1)
       PG_CONF="/etc/postgresql/${PG_VER}/main"
+      LUKS_DEV="/dev/vdb"
+      LUKS_NAME="pgdata"
+      PG_DATA_MOUNT="/mnt/pgdata"
 
-      # Fix server key ownership now that postgres user exists
+      # Stop the auto-created cluster apt installed; we use a different data dir.
+      systemctl stop postgresql || true
+      systemctl disable postgresql || true
+
+      # Format LUKS on first boot. Subsequent boots (after a patch that replaced
+      # the OS disk) see an existing LUKS container and skip the format.
+      if ! cryptsetup isLuks "${LUKS_DEV}" >/dev/null 2>&1; then
+        printf '%%s' "${LUKS_KEY}" | cryptsetup -q luksFormat "${LUKS_DEV}" -
+      fi
+      printf '%%s' "${LUKS_KEY}" | cryptsetup -q luksOpen "${LUKS_DEV}" "${LUKS_NAME}" -
+
+      # Create filesystem only if the volume is blank (first boot).
+      if ! blkid "/dev/mapper/${LUKS_NAME}" >/dev/null 2>&1; then
+        mkfs.ext4 -F "/dev/mapper/${LUKS_NAME}"
+      fi
+
+      mkdir -p "${PG_DATA_MOUNT}"
+      mount "/dev/mapper/${LUKS_NAME}" "${PG_DATA_MOUNT}"
+
+      # First-boot data init: seed the encrypted volume with the cluster files
+      # apt-install created at /var/lib/postgresql/<ver>/main. On re-patched
+      # boots the PG_VERSION file already exists and we skip this step.
+      FIRST_BOOT=0
+      if [ ! -f "${PG_DATA_MOUNT}/PG_VERSION" ]; then
+        FIRST_BOOT=1
+        cp -a "/var/lib/postgresql/${PG_VER}/main/." "${PG_DATA_MOUNT}/"
+        chown -R postgres:postgres "${PG_DATA_MOUNT}"
+        chmod 0700 "${PG_DATA_MOUNT}"
+      fi
+
       chown postgres:postgres /etc/ssl/private/pg-server.key
 
-      # Listen on all interfaces and set the port
+      # Point the cluster at the mounted encrypted volume.
+      sed -i "s|^#\?data_directory.*|data_directory = '${PG_DATA_MOUNT}'|" "${PG_CONF}/postgresql.conf"
       sed -i "s/^#\?listen_addresses.*/listen_addresses = '*'/" "${PG_CONF}/postgresql.conf"
       sed -i "s/^#\?port.*/port = ${DB_PORT}/" "${PG_CONF}/postgresql.conf"
       sed -i "s/^#\?max_connections.*/max_connections = ${MAX_CONNECTIONS}/" "${PG_CONF}/postgresql.conf"
 
-      # Enable SSL
       sed -i "s/^#\?ssl\b.*/ssl = on/" "${PG_CONF}/postgresql.conf"
       sed -i "s|^#\?ssl_cert_file.*|ssl_cert_file = '/etc/ssl/certs/pg-server.crt'|" "${PG_CONF}/postgresql.conf"
       sed -i "s|^#\?ssl_key_file.*|ssl_key_file = '/etc/ssl/private/pg-server.key'|" "${PG_CONF}/postgresql.conf"
       sed -i "s|^#\?ssl_ca_file.*|ssl_ca_file = '/etc/ssl/certs/pg-ca.crt'|" "${PG_CONF}/postgresql.conf"
 
-      # SSL-only remote connections (hostssl rejects plain-text clients)
       echo "hostssl all all 0.0.0.0/0 scram-sha-256" >> "${PG_CONF}/pg_hba.conf"
       echo "hostssl replication all 0.0.0.0/0 scram-sha-256" >> "${PG_CONF}/pg_hba.conf"
 
-      systemctl restart postgresql
+      systemctl enable postgresql
+      systemctl start postgresql
 
-      # Create admin user and database
-      sudo -u postgres psql -p "${DB_PORT}" <<EOSQL
+      # Role/database creation only on first boot. On re-patched boots the
+      # role and database already live in the encrypted volume.
+      if [ "${FIRST_BOOT}" = "1" ]; then
+        sudo -u postgres psql -p "${DB_PORT}" <<EOSQL
       DO \$\$
       BEGIN
         IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${MASTER_USER}') THEN
-cre          CREATE ROLE ${MASTER_USER} LOGIN SUPERUSER PASSWORD '${MASTER_PASSWORD}';
+          CREATE ROLE ${MASTER_USER} LOGIN SUPERUSER PASSWORD '${MASTER_PASSWORD}';
         END IF;
       END \$\$;
       SELECT 'CREATE DATABASE ${DB_NAME} OWNER ${MASTER_USER}'
         WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${DB_NAME}')\gexec
       EOSQL
+      fi
 runcmd:
   - systemctl enable --now qemu-guest-agent
   - netplan apply
-  - mkdir -p /var/lib/dbaas
-  - chown postgres:postgres /var/lib/dbaas
   - /etc/dbaas/bootstrap.sh
 final_message: "DBaaS bootstrap complete for %s"
 `,

@@ -32,9 +32,11 @@ A Kubernetes-native Database-as-a-Service that provisions managed PostgreSQL ins
 ### Install
 
 ```bash
+# Build the controller binary (output: bin/dbaas-controller)
+make
+
 # Validate the source locally
 go test ./...
-go build ./...
 
 # Apply the sample custom resource after your CRD/controller manifests are installed
 kubectl apply -f config/samples/dbinstance.yaml
@@ -419,6 +421,47 @@ kubectl patch dbi orders-prod --type merge -p '{"spec":{"deletionProtection":fal
 kubectl delete dbi orders-prod
 ```
 
+### Patching & Minor Version Upgrades
+
+OS-level security patches (kernel, openssl) and PostgreSQL minor-version updates are applied by changing `spec.osImage` to a newer Harvester `VirtualMachineImage`. The controller runs an *immutable rebuild*: the OS DataVolume is replaced from the new image while the encrypted pgdata DataVolume is reattached intact.
+
+```bash
+# Trigger a patch
+kubectl -n orders-team patch dbi orders-prod --type merge \
+  -p '{"spec":{"osImage":"ubuntu-22.04-server-cloudimg-amd64-20260501.img"}}'
+
+# Or via the Makefile
+make patch INSTANCE=orders-prod IMAGE=ubuntu-22.04-server-cloudimg-amd64-20260501.img NAMESPACE=orders-team
+
+# Watch progress
+kubectl -n orders-team get dbi orders-prod -w
+# NAME          STATUS     PHASE              CLASS         ENDPOINT      AGE
+# orders-prod   patching   PatchPending       db.m5.large   10.100.42.5   3d
+# orders-prod   patching   PatchSnapshotting  db.m5.large   10.100.42.5   3d
+# orders-prod   patching   PatchStopping      db.m5.large   10.100.42.5   3d
+# orders-prod   patching   PatchOSReplaced    db.m5.large   10.100.42.5   3d
+# orders-prod   patching   PatchStarting      db.m5.large   10.100.42.5   3d
+# orders-prod   patching   PatchVerifying     db.m5.large   10.100.42.5   3d
+# orders-prod   available  Available          db.m5.large   10.100.42.5   3d
+```
+
+Phase summary:
+
+| Phase | Action |
+|-------|--------|
+| `PatchPending` | Validate target image exists; record `previousOSImage` for rollback |
+| `PatchSnapshotting` | Pre-patch snapshot (placeholder until `DBSnapshot` controller lands) |
+| `PatchStopping` | Set `vm.spec.running=false`; wait for the VMI to terminate |
+| `PatchOSReplaced` | Delete the VM (OS DV cascades away); recreate it on the new image |
+| `PatchStarting` | VM resource is back; wait for the VMI to come up |
+| `PatchVerifying` | Wait for VMI Running + settle window; transition to `Available` |
+
+The patch state is persisted in `status.patchState` so a controller restart resumes the same operation. The pgdata DataVolume is created standalone and is never touched by the patch flow — only the OS DataVolume (which is owned by the VM via `dataVolumeTemplates`) is replaced.
+
+Design notes and trade-offs: see [`proposals/001-patching-and-minor-upgrades.md`](proposals/001-patching-and-minor-upgrades.md). The TLA+ model in [`proposals/tla/`](proposals/tla/) verifies that pgdata survives every reachable interleaving of patch, stop/start, and crash.
+
+> Major version upgrades (e.g. PostgreSQL 14 → 15) are out of scope for this flow — they require `pg_upgrade` and a separate workflow.
+
 ## Architecture
 
 ```
@@ -648,16 +691,18 @@ The controller advances one phase per reconcile loop iteration:
 ## Development
 
 ```bash
-# Build
-make build
+# Build the controller binary (output: bin/dbaas-controller)
+make           # default target
+make build     # equivalent
+
+# Onboard a tenant namespace (creates namespace + per-namespace RBAC)
+make tenant-onboard NAMESPACE=orders-team
 
 # Run locally against your kubeconfig
-make install   # install CRDs
-make run       # start controller + REST gateway
+./bin/dbaas-controller
 
 # Test
-make smoke-test  # creates a database via REST API
-make status      # kubectl get dbi
+go test ./...
 ```
 
 ## Project Structure

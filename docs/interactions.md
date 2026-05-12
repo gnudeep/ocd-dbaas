@@ -72,7 +72,7 @@ sequenceDiagram
     H-->>CTL: VM resource created
     CTL->>API: status.currentOSImage, secretName, caCertPem
 
-    Note over CTL,VM: → WaitingForCloudInit (poll every 10–15s)
+    Note over CTL,VM: → WaitingForCloudInit, poll every 10–15s
     CTL->>H: GetVMIReadiness
     H-->>CTL: phase=Pending
     VM->>CI: cloud-init runs userdata
@@ -160,7 +160,7 @@ sequenceDiagram
     CLI->>API: PATCH, generation++
     API->>CTL: watch event
 
-    Note over CTL: phase=available, generation != observed,<br/>needsPatch() = true
+    Note over CTL: phase=available, generation != observed,<br/>needsPatch returns true
     CTL->>API: phase=patching, provisioningPhase=PatchPending<br/>status.previousOSImage, patchState.targetOSImage
 
     Note over CTL,H: PatchPending — pre-flight validation
@@ -168,7 +168,7 @@ sequenceDiagram
     H-->>CTL: ns, name, storageClass
     CTL->>API: provisioningPhase=PatchSnapshotting
 
-    Note over CTL: PatchSnapshotting (placeholder — DBSnapshot controller TBD)
+    Note over CTL: PatchSnapshotting — placeholder, DBSnapshot controller TBD
     CTL->>API: patchState.snapshotName, provisioningPhase=PatchStopping
 
     Note over CTL,VM: PatchStopping
@@ -183,7 +183,7 @@ sequenceDiagram
     CTL->>H: VMResourceGone?
     H-->>CTL: false
     CTL->>H: DeletePostgresVM
-    Note over H: OS DV cascades via owner ref;<br/>pgdata DV (standalone) survives
+    Note over H: OS DV cascades via owner ref.<br/>pgdata DV is standalone and survives.
     CTL->>H: VMResourceGone? (next reconcile tick)
     H-->>CTL: true
     CTL->>H: RecreatePostgresVMForPatch<br/>(new osImage, same Secret, reattach pgdata DV)
@@ -191,7 +191,7 @@ sequenceDiagram
     CTL->>API: provisioningPhase=PatchStarting
 
     Note over VM,CI: VM boots on new image
-    VM->>CI: cloud-init runs (fresh OS, same userdata)
+    VM->>CI: cloud-init runs — fresh OS, same userdata
     CI->>CI: cryptsetup isLuks /dev/vdb → already LUKS,<br/>skip luksFormat
     CI->>VM: luksOpen, mount /mnt/pgdata
     CI->>CI: PG_VERSION exists → FIRST_BOOT=0,<br/>skip data seed
@@ -236,7 +236,7 @@ sequenceDiagram
     CTL->>API: status.phase=starting
     CTL->>H: StartVM (vm.spec.running=true)
     H-->>CTL: ok
-    Note over H: KubeVirt starts a new VMI;<br/>cloud-init does NOT re-run<br/>(same OS disk, same instance-id)
+    Note over H: KubeVirt starts a new VMI.<br/>cloud-init does NOT re-run —<br/>same OS disk, same instance-id.
     CTL->>API: status.phase=available<br/>observedGeneration=N
 ```
 
@@ -263,7 +263,7 @@ sequenceDiagram
     CTL->>API: status.phase=stopping
     CTL->>H: StopVM (vm.spec.running=false)
     H-->>CTL: ok
-    Note over H: KubeVirt drains and terminates the VMI.<br/>pgdata DV is preserved, OS DV is preserved<br/>(both attached to the stopped VM).
+    Note over H: KubeVirt drains and terminates the VMI.<br/>pgdata DV is preserved, OS DV is preserved.<br/>Both stay attached to the stopped VM.
     CTL->>API: status.phase=stopped<br/>"Storage preserved"
 ```
 
@@ -288,7 +288,7 @@ sequenceDiagram
     User->>CLI: kubectl patch dbi orders-prod<br/>-p '{"spec":{"dbInstanceClass":"db.m5.xlarge","allocatedStorage":200}}'
     CLI->>API: PATCH, generation++
     API->>CTL: watch event
-    Note over CTL: phase=available, generation != observed,<br/>needsPatch()=false → reconcileModify
+    Note over CTL: phase=available, generation != observed,<br/>needsPatch returns false → reconcileModify
     CTL->>API: status.phase=modifying
 
     par concurrent
@@ -366,10 +366,10 @@ sequenceDiagram
         App->>API: GET dbi orders-prod
         API-->>App: status.endpoint.jdbcUrl, status.caCertPem
     else configured statically
-        Note over App: jdbcUrl in app config; CA mounted as Secret
+        Note over App: jdbcUrl in app config, CA mounted as Secret
     end
 
-    Note over App,VM: TLS handshake (sslmode=verify-ca)
+    Note over App,VM: TLS handshake with sslmode=verify-ca
     App->>Net: TCP SYN → 10.x.x.x:5432
     alt same VPC
         Net->>VM: direct route
@@ -386,7 +386,7 @@ sequenceDiagram
 
     Note over App,VM: PostgreSQL startup
     App->>VM: StartupMessage + scram-sha-256 auth
-    Note over VM: pg_hba rejects non-SSL (hostssl-only)
+    Note over VM: pg_hba rejects non-SSL, hostssl-only
     VM-->>App: AuthenticationOk
     App->>VM: SQL queries...
 ```

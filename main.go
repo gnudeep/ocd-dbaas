@@ -73,6 +73,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Register the DBSnapshot reconciler
+	if err := (&controller.DBSnapshotReconciler{
+		Client:    mgr.GetClient(),
+		Harvester: hvClient,
+	}).SetupWithManager(mgr); err != nil {
+		logger.Error(err, "unable to create controller", "controller", "DBSnapshot")
+		os.Exit(1)
+	}
+
 	// Health checks
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		logger.Error(err, "unable to set up health check")

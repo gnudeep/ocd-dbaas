@@ -261,6 +261,7 @@ func (r *DBInstanceReconciler) phaseWaitReady(ctx context.Context, inst *dbaasv1
 		Port:    port,
 		JDBCURL: fmt.Sprintf("jdbc:postgresql://%s:%d/%s?ssl=true&sslmode=verify-ca", readiness.IP, port, dbName),
 	}
+	inst.Status.ManagementAddress = readiness.MgmtIP
 	inst.Status.ProvisioningPhase = dbaasv1.PhaseDatabaseReady
 	inst.Status.Message = "PostgreSQL is ready"
 
@@ -312,6 +313,10 @@ func (r *DBInstanceReconciler) phaseAvailable(ctx context.Context, inst *dbaasv1
 			JDBCURL: fmt.Sprintf("jdbc:postgresql://%s:%d/%s?ssl=true&sslmode=verify-ca", readiness.IP, port, dbName),
 		}
 		log.FromContext(ctx).Info("endpoint updated", "ip", readiness.IP)
+	}
+	if readiness.MgmtIP != "" && inst.Status.ManagementAddress != readiness.MgmtIP {
+		inst.Status.ManagementAddress = readiness.MgmtIP
+		log.FromContext(ctx).Info("management address updated", "ip", readiness.MgmtIP)
 	}
 
 	return ctrl.Result{RequeueAfter: 60 * time.Second}, r.statusUpdate(ctx, inst)

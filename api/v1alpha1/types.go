@@ -140,8 +140,13 @@ type DBInstanceStatus struct {
 	// Conditions for each sub-resource.
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
-	// Endpoint is populated when the database is reachable.
+	// Endpoint is the tenant-facing DB address (vpc-net / NAD IP).
 	Endpoint *Endpoint `json:"endpoint,omitempty"`
+
+	// ManagementAddress is the mgmt-net IP used by the controller for SSH and
+	// internal operations. It is always on the shared management network
+	// regardless of which NAD the tenant uses for DB connectivity.
+	ManagementAddress string `json:"managementAddress,omitempty"`
 
 	// MasterUserSecret references the K8s Secret with credentials.
 	MasterUserSecret *MasterUserSecretRef `json:"masterUserSecret,omitempty"`
@@ -155,6 +160,9 @@ type DBInstanceStatus struct {
 
 	// CACertPEM is the generated CA for SSL verification.
 	CACertPEM string `json:"caCertPem,omitempty"`
+
+	// BackupStatus summarises the most recent pgBackRest backup activity.
+	BackupStatus *BackupStatus `json:"backupStatus,omitempty"`
 
 	// ReadReplicas tracks child replica identifiers.
 	ReadReplicas []string `json:"readReplicas,omitempty"`
@@ -170,6 +178,16 @@ type Endpoint struct {
 	Address string `json:"address"`
 	Port    int    `json:"port"`
 	JDBCURL string `json:"jdbcUrl,omitempty"`
+}
+
+// BackupStatus summarises the most recent pgBackRest backup activity.
+type BackupStatus struct {
+	// LastFullBackup is when the last full backup completed.
+	LastFullBackup *metav1.Time `json:"lastFullBackup,omitempty"`
+	// LastIncrBackup is when the last incremental backup completed.
+	LastIncrBackup *metav1.Time `json:"lastIncrBackup,omitempty"`
+	// WALArchiving is true once archive_mode is confirmed active.
+	WALArchiving bool `json:"walArchiving"`
 }
 
 type MasterUserSecretRef struct {
@@ -297,6 +315,11 @@ const (
 	LabelMetrics  = "dbaas.wso2.com/metrics"
 
 	FinalizerName = "dbaas.wso2.com/cleanup"
+
+	// Secret keys for the credentials Secret created per DBInstance.
+	SecretKeySSHPrivateKey = "ssh_private_key"
+	SecretKeyCAKey         = "ca_key"
+	SecretKeyCACert        = "ca_cert"
 )
 
 // InstanceClassSpec maps RDS-style class names to Harvester VM resources.

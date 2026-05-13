@@ -1,15 +1,18 @@
 package harvester
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
 	"hash/fnv"
+	"net"
 	"strings"
 	"sync"
 	"time"
 
+	"golang.org/x/crypto/ssh"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -90,10 +93,13 @@ type VMCreateParams struct {
 }
 
 // VMIReadiness bundles phase, IP, and postgres-readiness from a single VMI fetch.
+// IP is the vpc-net (NAD) address — tenant-facing. MgmtIP is the mgmt-net
+// address — used by the controller for SSH regardless of which NAD the tenant uses.
 type VMIReadiness struct {
 	Running bool
-	IP      string
-	Ready   bool // Running AND uptime > 3 min
+	IP      string // vpc-net / NAD IP — tenant-facing endpoint
+	MgmtIP  string // mgmt-net IP — controller SSH target
+	Ready   bool   // Running AND uptime > 3 min
 }
 
 // ============================================================
@@ -267,21 +273,47 @@ func (c *Client) CreatePostgresVM(ctx context.Context, p VMCreateParams) (vmName
 	}
 	caCertPEM = tls.CACertPEM
 
+	// Generate Ed25519 SSH key for controller→VM access (backup triggers, diagnostics).
+	sshKey, sshErr := generateSSHKeyPair()
+	if sshErr != nil {
+		err = fmt.Errorf("SSH key generation: %w", sshErr)
+		return
+	}
+
+	// Resolve S3 credentials from the referenced K8s Secret (if backup is configured).
+	var s3 *resolvedS3Config
+	if p.S3Config != nil {
+		s3Data, s3Err := c.GetSecret(ctx, p.Namespace, p.S3Config.SecretRef)
+		if s3Err != nil {
+			err = fmt.Errorf("read S3 secret %q: %w", p.S3Config.SecretRef, s3Err)
+			return
+		}
+		s3 = &resolvedS3Config{
+			Endpoint:  p.S3Config.Endpoint,
+			Bucket:    p.S3Config.Bucket,
+			Region:    p.S3Config.Region,
+			Path:      fmt.Sprintf("/%s", p.ID),
+			AccessKey: string(s3Data["accessKey"]),
+			SecretKey: string(s3Data["secretKey"]),
+		}
+	}
+
 	// Store credentials and cloud-init in K8s Secret
-	cloudInit := buildCloudInit(p, adminPw, replPw, exporterPw, luksKey, tls)
+	cloudInit := buildCloudInit(p, adminPw, replPw, exporterPw, luksKey, tls, sshKey, s3)
 	secret := newUnstructured("v1", "Secret", secretName, p.Namespace)
 	_ = unstructured.SetNestedField(secret.Object, "Opaque", "type")
 	_ = unstructured.SetNestedField(secret.Object, map[string]interface{}{
-		"admin_user":        p.MasterUser,
-		"admin_password":    adminPw,
-		"repl_password":     replPw,
-		"exporter_password": exporterPw,
-		"luks_key":          luksKey,
-		"ca_cert":           tls.CACertPEM,
-		"ca_key":            tls.CAKeyPEM,
-		"server_cert":       tls.ServerCertPEM,
-		"server_key":        tls.ServerKeyPEM,
-		"userdata":          cloudInit, // referenced by VM spec; avoids plain-text in VM CR
+		"admin_user":                    p.MasterUser,
+		"admin_password":                adminPw,
+		"repl_password":                 replPw,
+		"exporter_password":             exporterPw,
+		"luks_key":                      luksKey,
+		dbaasv1.SecretKeyCACert:         tls.CACertPEM,
+		dbaasv1.SecretKeyCAKey:          tls.CAKeyPEM,
+		"server_cert":                   tls.ServerCertPEM,
+		"server_key":                    tls.ServerKeyPEM,
+		dbaasv1.SecretKeySSHPrivateKey:  sshKey.PrivateKeyPEM,
+		"userdata":                      cloudInit, // referenced by VM spec; avoids plain-text in VM CR
 	}, "stringData")
 	if _, e := c.Dynamic.Resource(secretGVR).Namespace(p.Namespace).Create(ctx, secret, metav1.CreateOptions{}); e != nil {
 		if err = ignoreAlreadyExists(e); err != nil {
@@ -376,11 +408,12 @@ func (c *Client) GetVMIReadiness(ctx context.Context, ns, vmName string) (VMIRea
 	phase, _, _ := unstructured.NestedString(vmi.Object, "status", "phase")
 	running := phase == vmiPhaseRunning
 
-	var ip string
+	var ip, mgmtIP string
 	interfaces, _, _ := unstructured.NestedSlice(vmi.Object, "status", "interfaces")
-	// Prefer vpc-net (Multus bridge) over mgmt-net (pod masquerade).
-	// KubeVirt lists masquerade first, so we scan all interfaces and pick
-	// vpc-net explicitly; fall back to the first address if not found.
+	// Scan all interfaces and pick by name:
+	//   vpc-net  → tenant-facing endpoint (IP)
+	//   mgmt-net → controller SSH target (MgmtIP)
+	// Fall back: first non-empty address goes to IP if vpc-net is not found.
 	var fallbackIP string
 	for _, iface := range interfaces {
 		ifMap, ok := iface.(map[string]interface{})
@@ -392,9 +425,11 @@ func (c *Client) GetVMIReadiness(ctx context.Context, ns, vmName string) (VMIRea
 			continue
 		}
 		name, _ := ifMap["name"].(string)
-		if name == "vpc-net" {
+		switch name {
+		case "vpc-net":
 			ip = addr
-			break
+		case "mgmt-net":
+			mgmtIP = addr
 		}
 		if fallbackIP == "" {
 			fallbackIP = addr
@@ -405,7 +440,7 @@ func (c *Client) GetVMIReadiness(ctx context.Context, ns, vmName string) (VMIRea
 	}
 
 	ready := running && time.Since(vmi.GetCreationTimestamp().Time) > 3*time.Minute
-	return VMIReadiness{Running: running, IP: ip, Ready: ready}, nil
+	return VMIReadiness{Running: running, IP: ip, MgmtIP: mgmtIP, Ready: ready}, nil
 }
 
 // setVMRunning sets spec.running on the VM.
@@ -417,6 +452,42 @@ func (c *Client) setVMRunning(ctx context.Context, ns, vmName string, running bo
 	_ = unstructured.SetNestedField(vm.Object, running, "spec", "running")
 	_, err = c.Dynamic.Resource(vmGVR).Namespace(ns).Update(ctx, vm, metav1.UpdateOptions{})
 	return err
+}
+
+// SSHExec dials the VM at ip:22 using the Ed25519 private key stored in the
+// credentials Secret, runs command, and returns combined stdout+stderr.
+// HostKeyCallback is InsecureIgnoreHostKey because VMs are ephemeral and their
+// host keys are not pre-registered anywhere — we trust the network (VPC VLAN).
+func (c *Client) SSHExec(ctx context.Context, ip, privateKeyPEM, command string) (string, error) {
+	signer, err := ssh.ParsePrivateKey([]byte(privateKeyPEM))
+	if err != nil {
+		return "", fmt.Errorf("parse private key: %w", err)
+	}
+	cfg := &ssh.ClientConfig{
+		User:            "ubuntu",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec
+		Timeout:         30 * time.Second,
+	}
+	conn, err := ssh.Dial("tcp", net.JoinHostPort(ip, "22"), cfg)
+	if err != nil {
+		return "", fmt.Errorf("ssh dial %s: %w", ip, err)
+	}
+	defer conn.Close()
+
+	sess, err := conn.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("ssh session: %w", err)
+	}
+	defer sess.Close()
+
+	var buf bytes.Buffer
+	sess.Stdout = &buf
+	sess.Stderr = &buf
+	if err := sess.Run(command); err != nil {
+		return buf.String(), fmt.Errorf("ssh run %q: %w", command, err)
+	}
+	return buf.String(), nil
 }
 
 // GetSecret returns the Secret's data map (values are raw bytes).

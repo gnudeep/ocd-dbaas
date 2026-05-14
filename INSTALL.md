@@ -40,13 +40,45 @@ kubectl apply -f config/rbac/
 
 This creates the `dbaas-system` namespace, the `dbaas-controller` ServiceAccount, a ClusterRole scoped to the Harvester APIs the controller needs (KubeVirt, CDI, Kube-OVN, core, monitoring), and the ClusterRoleBinding that ties them together.
 
-## 4. Install the controller Deployment + gateway Service
+## 4. Create the tenant configuration ConfigMap
+
+The controller Deployment mounts a ConfigMap named `dbaas-tenants` at
+`/etc/dbaas/tenants.yaml`. Create this ConfigMap before starting the controller,
+otherwise the pod will stay in `ContainerCreating` with a `FailedMount` event.
+
+Review `config/tenants.yaml` and make sure the tenant namespace and
+`networkRef` match your Harvester cluster. For example, if your tenant uses an
+existing Harvester VM network exposed as a NetworkAttachmentDefinition, set:
+
+```yaml
+tenants:
+- group: iaas-dbs
+  namespace: default
+  networkRef: default/vm-network
+```
+
+Then create or update the ConfigMap:
+
+```bash
+kubectl create configmap dbaas-tenants \
+  --from-file=tenants.yaml=config/tenants.yaml \
+  -n dbaas-system \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+Verify it exists:
+
+```bash
+kubectl -n dbaas-system get configmap dbaas-tenants
+```
+
+## 5. Install the controller Deployment + gateway Service
 
 ```bash
 kubectl apply -f config/manager/
 ```
 
-## 5. Wait for the controller to come up
+## 6. Wait for the controller to come up
 
 ```bash
 kubectl -n dbaas-system rollout status deploy/dbaas-controller --timeout=120s
@@ -54,7 +86,7 @@ kubectl -n dbaas-system get pods
 kubectl -n dbaas-system logs deploy/dbaas-controller --tail=50
 ```
 
-## 6. Smoke-test with a sample database
+## 7. Smoke-test with a sample database
 
 ```bash
 kubectl apply -f config/samples/dbinstance.yaml
@@ -154,3 +186,4 @@ kubectl delete -f config/crd/
 - The CRDs use `x-kubernetes-preserve-unknown-fields: true` on `spec`/`status`. They are functional but not strict. Running `controller-gen` against `api/v1alpha1` will regenerate fully-typed schemas.
 - The REST gateway has no built-in authentication. Do not expose it outside the cluster without placing an auth-enforcing ingress or API gateway in front of it. See the Trust Model section in `README.md`.
 - Upgrading the controller image: edit `config/manager/manager.yaml` (or `kubectl -n dbaas-system set image deploy/dbaas-controller controller=wso2vick/ocd-dbaas:<new-tag>`) and re-apply.
+

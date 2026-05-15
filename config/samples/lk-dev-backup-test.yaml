@@ -1,0 +1,24 @@
+apiVersion: dbaas.wso2.com/v1alpha1
+kind: DBInstance
+metadata:
+  name: backup-test-01
+  namespace: ssl-test
+spec:
+  dbInstanceClass: db.t3.small
+  dbName: testdb
+  port: 5432
+  masterUsername: dbadmin
+  manageMasterUserPassword: true
+  allocatedStorage: 10
+  storageType: longhorn
+  deletionProtection: false
+  running: true
+  vmPassword: dbaas-dev
+  osImage: ubuntu-22-04
+  networkRef: iaas/vm-network-001
+  preferredBackupWindow: "02:00-03:00"
+  s3BackupConfig:
+    endpoint: s3.ap-southeast-1.amazonaws.com
+    bucket: wso2-dbaas-backups-lk
+    region: ap-southeast-1
+    secretRef: pg-s3-backup-creds

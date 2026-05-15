@@ -1,0 +1,8 @@
+apiVersion: dbaas.wso2.com/v1alpha1
+kind: DBSnapshot
+metadata:
+  name: backup-test-01-snap-01
+  namespace: ssl-test
+spec:
+  dbInstanceRef: backup-test-01
+  type: full

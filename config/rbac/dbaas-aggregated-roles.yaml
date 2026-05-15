@@ -1,0 +1,31 @@
+# Aggregate DBaaS custom resources into the standard Kubernetes role hierarchy.
+# ClusterRole/admin (and edit) includes any ClusterRole labelled aggregate-to-admin.
+# ClusterRole/view includes any ClusterRole labelled aggregate-to-view.
+# Rancher project-owner maps to ClusterRole/admin within project namespaces,
+# so tenants with project-owner get full DBaaS CR access without additional bindings.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dbaas-aggregate-to-admin
+  labels:
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+    rbac.authorization.k8s.io/aggregate-to-edit: "true"
+rules:
+- apiGroups: ["dbaas.wso2.com"]
+  resources: ["dbinstances", "dbinstances/status", "dbinstances/finalizers",
+              "dbsnapshots", "dbsnapshots/status", "dbsnapshots/finalizers",
+              "dbparametergroups"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dbaas-aggregate-to-view
+  labels:
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+rules:
+- apiGroups: ["dbaas.wso2.com"]
+  resources: ["dbinstances", "dbinstances/status",
+              "dbsnapshots", "dbsnapshots/status",
+              "dbparametergroups"]
+  verbs: ["get", "list", "watch"]

@@ -194,7 +194,7 @@ func (r *DBInstanceReconciler) phaseVM(ctx context.Context, inst *dbaasv1.DBInst
 	}
 	osImage := inst.Spec.OSImage
 	if osImage == "" {
-		osImage = "ubuntu-22.04-server-cloudimg-amd64.img"
+		osImage = "ubuntu-22-04"
 	}
 
 	vmName, secretName, caCertPEM, err := r.Harvester.CreatePostgresVM(ctx, harvester.VMCreateParams{
@@ -261,6 +261,7 @@ func (r *DBInstanceReconciler) phaseWaitReady(ctx context.Context, inst *dbaasv1
 		Port:    port,
 		JDBCURL: fmt.Sprintf("jdbc:postgresql://%s:%d/%s?ssl=true&sslmode=verify-ca", readiness.IP, port, dbName),
 	}
+	inst.Status.ManagementAddress = readiness.MgmtIP
 	inst.Status.ProvisioningPhase = dbaasv1.PhaseDatabaseReady
 	inst.Status.Message = "PostgreSQL is ready"
 
@@ -312,6 +313,10 @@ func (r *DBInstanceReconciler) phaseAvailable(ctx context.Context, inst *dbaasv1
 			JDBCURL: fmt.Sprintf("jdbc:postgresql://%s:%d/%s?ssl=true&sslmode=verify-ca", readiness.IP, port, dbName),
 		}
 		log.FromContext(ctx).Info("endpoint updated", "ip", readiness.IP)
+	}
+	if readiness.MgmtIP != "" && inst.Status.ManagementAddress != readiness.MgmtIP {
+		inst.Status.ManagementAddress = readiness.MgmtIP
+		log.FromContext(ctx).Info("management address updated", "ip", readiness.MgmtIP)
 	}
 
 	return ctrl.Result{RequeueAfter: 60 * time.Second}, r.statusUpdate(ctx, inst)

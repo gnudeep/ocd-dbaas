@@ -26,6 +26,18 @@ tenants:
         - db.m5.large
         - db.m5.xlarge
 
+  # db-test — DBaaS demo tenant (dbuser@test.com via Asgardeo group "testgroup").
+  # Uses vm-network-002 (VLAN 701, 172.22.101.0/24) — separate from vm-network-001.
+  - group: testgroup
+    namespace: db-test
+    networkRef: iaas/vm-network-002
+    quotas:
+      maxInstances: 3
+      maxStorageGiB: 100
+      allowedInstanceClasses:
+        - db.t3.small
+        - db.t3.medium
+
   # Example: orders service team
   # Uncomment and adjust when onboarding this team.
   # - group: orders-team-dbs

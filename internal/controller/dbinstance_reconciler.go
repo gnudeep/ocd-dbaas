@@ -194,7 +194,7 @@ func (r *DBInstanceReconciler) phaseVM(ctx context.Context, inst *dbaasv1.DBInst
 	}
 	osImage := inst.Spec.OSImage
 	if osImage == "" {
-		osImage = "ubuntu-22.04-server-cloudimg-amd64.img"
+		osImage = "ubuntu-22-04"
 	}
 
 	vmName, secretName, caCertPEM, err := r.Harvester.CreatePostgresVM(ctx, harvester.VMCreateParams{

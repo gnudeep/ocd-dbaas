@@ -12,12 +12,12 @@ spec:
         name: db-test-client-disk
         annotations:
           # Harvester clones this image into the blank volume at boot
-          harvesterhci.io/imageId: default/image-8hdn4
+          harvesterhci.io/imageId: default/image-p7smm
       spec:
         source:
           blank: {}
         pvc:
-          storageClassName: longhorn-image-8hdn4
+          storageClassName: longhorn-image-p7smm
           accessModes:
             - ReadWriteMany
           volumeMode: Block
